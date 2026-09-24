@@ -1,4 +1,6 @@
 """核心算法与 FastAPI 接口测试。"""
+from fractions import Fraction
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -14,6 +16,7 @@ from app.placement import (
     parse_blocks,
     plan_positions,
 )
+from app.reading_load import count_display_chars, find_reading_zones
 from app.srt import BOM, SrtParseError, format_srt, parse_srt, rewrite_srt
 from app.timecode import format_timecode, parse_timecode
 
@@ -536,3 +539,213 @@ def test_api_placement_accepts_empty_blocks():
     assert all(c["position"] == "bottom" for c in data["cues"])
     assert data["merged_top_blocks"] == []
     assert data["merged_bottom_blocks"] == []
+
+
+# ---------- 阅读负荷热区 ----------
+
+LOAD_SRT = (
+    "1\n00:00:00,000 --> 00:00:02,000\n一二三四五六\n\n"            # 3 字/秒
+    "2\n00:00:01,000 --> 00:00:03,000\n四五六\n\n"                # 1.5 字/秒
+    "3\n00:00:03,000 --> 00:00:04,000\n七八九十\n"                # 4 字/秒
+)
+
+
+def _load_cues():
+    return parse_srt(LOAD_SRT)
+
+
+def test_count_display_chars_strips_all_unicode_whitespace():
+    assert count_display_chars("你好 世界\n第二行\t末　了") == 9
+    assert count_display_chars("\n\t 　") == 0
+
+
+def test_cue_loads_rate_and_duration():
+    loads, _ = find_reading_zones(_load_cues(), Fraction(100), 0)
+    assert [l.char_count for l in loads] == [6, 3, 4]
+    assert [l.duration_ms for l in loads] == [2000, 2000, 1000]
+    assert [float(l.rate) for l in loads] == [3.0, 1.5, 4.0]
+    assert [l.order for l in loads] == [1, 2, 3]
+
+
+def test_overlapping_rates_add_on_half_open_timeline():
+    # 阈值 4：仅 [1s, 2s) 内 3 + 1.5 = 4.5 严格超过；[2s,3s) 仅 1.5 不超
+    _, zones = find_reading_zones(_load_cues(), Fraction(4), 0)
+    assert len(zones) == 1
+    assert (zones[0].start, zones[0].end) == (1000, 2000)
+    assert zones[0].peak_rate == Fraction(9, 2)
+    assert zones[0].cue_orders == (1, 2)
+
+
+def test_threshold_is_strict_greater_than():
+    # 阈值 4.5：合计恰好 4.5，严格超过不成立；字幕3 速率 4 也不超 -> 无热区
+    _, zones = find_reading_zones(_load_cues(), Fraction(45, 10), 0)
+    assert zones == []
+
+
+def test_touching_cues_do_not_overlap():
+    # 字幕1 结束 == 字幕2 开始（3s）：半开时间轴上首尾相接不算重叠
+    cues = parse_srt(
+        "1\n00:00:00,000 --> 00:00:03,000\n一二三四五六七八\n\n"
+        "2\n00:00:03,000 --> 00:00:06,000\n一二三四五六七八\n"
+    )
+    # 每条 8 字 / 3 秒；阈值 8/3：单条不严格超过，相接点也不叠加 -> 无热区
+    _, zones = find_reading_zones(cues, Fraction(8, 3), 0)
+    assert zones == []
+    # 阈值严格小于单条速率时，相接的两段各自超阈后合并为 [0,6s)
+    _, merged = find_reading_zones(cues, Fraction("2.6"), 0)
+    assert len(merged) == 1
+    assert (merged[0].start, merged[0].end) == (0, 6000)
+    assert merged[0].cue_orders == (1, 2)
+    assert merged[0].peak_rate == Fraction(8, 3)
+
+
+def test_adjacent_over_segments_merge_into_one_zone():
+    # 字幕1：8字/4s=2；字幕2：10字/2s=5；字幕3：9字/3s=3
+    cues = parse_srt(
+        "1\n00:00:00,000 --> 00:00:04,000\n一二三四五六七八\n\n"
+        "2\n00:00:02,000 --> 00:00:04,000\n一二三四五六七八九十\n\n"
+        "3\n00:00:04,000 --> 00:00:07,000\n一二三四五六七八九\n"
+    )
+    # 分段：[0,2)=2；[2,4)=7（字幕1+2）；[4,7)=3（字幕3，与上一段相接）
+    # 阈值 2：[0,2) 不严格超，[2,4) 与 [4,7) 在 4s 处相接 -> 合并为 [2,7)
+    _, zones = find_reading_zones(cues, Fraction(2), 0)
+    assert len(zones) == 1
+    assert (zones[0].start, zones[0].end) == (2000, 7000)
+    assert zones[0].peak_rate == 7
+    assert zones[0].cue_orders == (1, 2, 3)
+
+
+def test_min_duration_filters_after_merge():
+    # 同一热区 1000ms：下限 1000 保留，1001 丢弃
+    _, keep = find_reading_zones(_load_cues(), Fraction(4), 1000)
+    assert len(keep) == 1 and keep[0].end - keep[0].start == 1000
+    _, drop = find_reading_zones(_load_cues(), Fraction(4), 1001)
+    assert drop == []
+    # 下限 0 不影响
+    _, zero = find_reading_zones(_load_cues(), Fraction(4), 0)
+    assert len(zero) == 1
+
+
+def test_ms_precision_not_whole_second_sampling():
+    # 仅 150ms 的毫秒级峰值也能检出（整秒采样会漏掉）
+    cues = parse_srt(
+        "1\n00:00:00,000 --> 00:00:10,000\n慢\n\n"
+        "2\n00:00:05,000 --> 00:00:05,150\n甲乙丙丁戊己庚\n"
+    )
+    _, zones = find_reading_zones(cues, Fraction(40), 0)
+    assert [(z.start, z.end) for z in zones] == [(5000, 5150)]
+    # 峰值为 7 字 / 0.15 秒（慢速字幕的 0.1 字/秒可忽略）
+    assert zones[0].peak_rate > 46
+    assert zones[0].cue_orders == (1, 2)
+
+
+def test_float_threshold_compared_exactly():
+    # 0.1+0.2 在二进制浮点下 != 0.3；合计速率恰为 0.3（3字/10秒）时，
+    # 以十进制短表示构造的阈值 0.3 不应误判为严格超过
+    cues = parse_srt("1\n00:00:00,000 --> 00:00:10,000\n三个字\n")
+    _, zones = find_reading_zones(cues, Fraction("0.3"), 0)
+    assert zones == []
+    _, zones_over = find_reading_zones(cues, Fraction("0.299999"), 0)
+    assert len(zones_over) == 1
+
+
+def test_cue_orders_are_input_positions_sorted():
+    # 时间乱序输入：参与序号仍按输入顺序返回，跨分段合并后升序去重
+    cues = parse_srt(
+        "9\n00:00:02,000 --> 00:00:05,000\n高速重叠字幕内容在这里\n\n"
+        "7\n00:00:00,000 --> 00:00:03,000\n另一条更早开始的字幕哦\n"
+    )
+    _, zones = find_reading_zones(cues, Fraction(3), 0)
+    assert zones
+    # SRT 序号原样（9、7），但热区引用的是输入顺序号 (1, 2)
+    assert zones[0].cue_orders == (1, 2)
+    assert [c.index for c in cues] == ["9", "7"]
+
+
+def test_reading_load_page_served():
+    resp = client.get("/reading-load")
+    assert resp.status_code == 200
+    assert "阅读负荷热区" in resp.text
+    assert "/api/reading-load" in resp.text
+
+
+def load_body(**overrides):
+    body = {
+        "srt": LOAD_SRT,
+        "rate_threshold": 4,
+        "min_duration_ms": 1000,
+    }
+    body.update(overrides)
+    return body
+
+
+def test_api_reading_load_success():
+    resp = client.post("/api/reading-load", json=load_body())
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["cue_count"] == 3
+    assert data["zone_count"] == 1
+    assert data["cues"][0]["order"] == 1
+    assert data["cues"][0]["index"] == "1"
+    assert data["cues"][0]["char_count"] == 6
+    assert data["cues"][0]["rate"] == 3.0
+    zone = data["zones"][0]
+    assert zone["start"] == "00:00:01,000"
+    assert zone["end"] == "00:00:02,000"
+    assert zone["duration_ms"] == 1000
+    assert zone["peak_rate"] == 4.5
+    assert zone["cue_orders"] == [1, 2]
+
+
+def test_api_reading_load_no_zone():
+    resp = client.post(
+        "/api/reading-load", json=load_body(rate_threshold=100, min_duration_ms=0)
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["zones"] == []
+
+
+def test_api_reading_load_rejects_bad_srt():
+    resp = client.post("/api/reading-load", json=load_body(srt="garbage"))
+    assert resp.status_code == 422
+    assert resp.json()["detail"]["type"] == "srt"
+
+
+@pytest.mark.parametrize("bad_threshold", [0, -1, -0.1, True, False, "5", None])
+def test_api_reading_load_rejects_bad_threshold(bad_threshold):
+    resp = client.post(
+        "/api/reading-load", json=load_body(rate_threshold=bad_threshold)
+    )
+    assert resp.status_code == 422
+    assert resp.json()["detail"]["field"] == "rate_threshold"
+
+
+@pytest.mark.parametrize("bad_duration", [-1, 1.5, True, False, "5", None])
+def test_api_reading_load_rejects_bad_duration(bad_duration):
+    resp = client.post(
+        "/api/reading-load", json=load_body(min_duration_ms=bad_duration)
+    )
+    assert resp.status_code == 422
+    assert resp.json()["detail"]["field"] == "min_duration_ms"
+
+
+def test_api_reading_load_accepts_float_threshold():
+    resp = client.post(
+        "/api/reading-load", json=load_body(rate_threshold=4.5, min_duration_ms=0)
+    )
+    assert resp.status_code == 200, resp.text
+    # 合计恰好 4.5：严格超过不成立
+    assert resp.json()["zones"] == []
+
+
+def test_api_reading_load_nan_token_is_422_not_500():
+    resp = client.post(
+        "/api/reading-load",
+        content=(
+            '{"srt":"1\\n00:00:01,000 --> 00:00:02,000\\n好\\n",'
+            '"rate_threshold":NaN,"min_duration_ms":0}'
+        ),
+        headers={"Content-Type": "application/json"},
+    )
+    assert resp.status_code == 422
+    assert resp.json()["detail"]["field"] == "rate_threshold"

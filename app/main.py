@@ -1,11 +1,15 @@
-"""字幕时间漂移校正与上下位置规划 Web 服务（FastAPI）。"""
+"""字幕时间漂移校正、上下位置规划与阅读负荷热区 Web 服务（FastAPI）。"""
 from __future__ import annotations
 
+import math
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException
+from fractions import Fraction
+
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse
-from pydantic import BaseModel, Field, StrictInt
+from pydantic import BaseModel, Field, StrictFloat, StrictInt, field_validator
 
 from .mapping import AnchorError, PiecewiseMapping, build_anchors
 from .placement import (
@@ -16,16 +20,55 @@ from .placement import (
     parse_blocks,
     plan_positions,
 )
+from .reading_load import find_reading_zones
 from .srt import SrtParseError, parse_srt, rewrite_srt
 from .timecode import format_signed_timecode, format_timecode
 
 STATIC_DIR = Path(__file__).parent / "static"
 
 app = FastAPI(
-    title="字幕校正与位置规划工具",
-    description="粘贴 SRT 后可做时间漂移校正，或按画面遮挡时段规划字幕上下位置。",
-    version="1.1.0",
+    title="字幕校正、位置规划与阅读负荷工具",
+    description="粘贴 SRT 后可做时间漂移校正、按画面遮挡时段规划字幕上下位置，"
+    "或分析重叠字幕叠加后的阅读负荷热区。",
+    version="1.2.0",
 )
+
+_FIELD_LABELS = {
+    "rate_threshold": "阅读速率阈值（字/秒）",
+    "min_duration_ms": "最短持续时长（毫秒）",
+    "switch_cost_ms": "相邻字幕上下换位代价（毫秒）",
+}
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(
+    request: Request, exc: RequestValidationError
+) -> JSONResponse:
+    """请求体字段校验失败统一返回 422 中文说明。
+
+    非有限浮点（NaN / Infinity）不能原样回显（标准 JSON 无法序列化，默认
+    处理器会直接 500），这里按字段给出固定中文提示。
+    """
+    for err in exc.errors():
+        loc = err.get("loc") or ()
+        field = loc[-1] if loc else None
+        label = _FIELD_LABELS.get(str(field), "请求参数")
+        value = err.get("input")
+        if isinstance(value, float) and not math.isfinite(value):
+            message = f"{label}必须是有限的数字。"
+        elif err.get("type") in ("float_type", "int_type"):
+            message = f"{label}必须是数字。"
+        elif err.get("type") == "greater_than":
+            message = f"{label}必须严格大于 0。"
+        elif err.get("type") == "greater_than_equal":
+            message = f"{label}不能小于 0。"
+        else:
+            message = f"{label}不合法。"
+        return JSONResponse(
+            status_code=422,
+            content={"detail": {"type": "validation", "field": field, "message": message}},
+        )
+    return JSONResponse(status_code=422, content={"detail": {"type": "validation"}})
 
 
 class AnchorPair(BaseModel):
@@ -98,6 +141,51 @@ class PlacementResponse(BaseModel):
     switch_count: int
 
 
+class ReadingLoadRequest(BaseModel):
+    srt: str = Field(..., description="原始 SRT 内容")
+    rate_threshold: StrictFloat = Field(
+        ..., gt=0, description="阅读速率阈值（字/秒），必须为正数"
+    )
+    min_duration_ms: StrictInt = Field(
+        ..., ge=0, description="热区最短连续时长（非负整数毫秒）"
+    )
+
+    @field_validator("rate_threshold")
+    @classmethod
+    def _threshold_must_be_finite(cls, value: float) -> float:
+        if value != value or value in (float("inf"), float("-inf")):
+            raise ValueError("阅读速率阈值必须是有限的正数，不能为 NaN 或 Infinity。")
+        return value
+
+
+class CueLoadView(BaseModel):
+    order: int
+    index: str
+    start: str
+    end: str
+    char_count: int
+    duration_ms: int
+    rate: float
+    text: str
+
+
+class ReadingZoneView(BaseModel):
+    start: str
+    end: str
+    duration_ms: int
+    peak_rate: float
+    cue_orders: list[int]
+
+
+class ReadingLoadResponse(BaseModel):
+    rate_threshold: float
+    min_duration_ms: int
+    cue_count: int
+    zone_count: int
+    cues: list[CueLoadView]
+    zones: list[ReadingZoneView]
+
+
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
@@ -111,6 +199,11 @@ def index() -> FileResponse:
 @app.get("/placement")
 def placement_page() -> FileResponse:
     return FileResponse(STATIC_DIR / "placement.html")
+
+
+@app.get("/reading-load")
+def reading_load_page() -> FileResponse:
+    return FileResponse(STATIC_DIR / "reading_load.html")
 
 
 @app.post("/api/correct", response_model=CorrectResponse)
@@ -234,4 +327,52 @@ def placement(req: PlacementRequest) -> PlacementResponse | JSONResponse:
         merged_bottom_blocks=block_views(bottom_blocks),
         total_occluded_ms=sum(v.occluded_ms for v in cue_views),
         switch_count=count_switches(placements),
+    )
+
+
+@app.post("/api/reading-load", response_model=ReadingLoadResponse)
+def reading_load(req: ReadingLoadRequest) -> ReadingLoadResponse | JSONResponse:
+    # 1. 复用现有 SRT 解析器
+    try:
+        cues = parse_srt(req.srt)
+    except SrtParseError as exc:
+        raise HTTPException(status_code=422, detail={"type": "srt", "message": str(exc)})
+
+    # 2. 按起止事件扫描半开时间轴（阈值经十进制短表示转 Fraction 精确比较：
+    #    输入 0.3 即数学意义的 0.3，杜绝二进制浮点误差影响严格大于判定）
+    loads, zones = find_reading_zones(
+        cues, Fraction(str(req.rate_threshold)), req.min_duration_ms
+    )
+
+    cue_views = [
+        CueLoadView(
+            order=load.order,
+            index=cue.index,
+            start=format_timecode(cue.start),
+            end=format_timecode(cue.end),
+            char_count=load.char_count,
+            duration_ms=load.duration_ms,
+            rate=round(float(load.rate), 3),
+            text=cue.text,
+        )
+        for cue, load in zip(cues, loads)
+    ]
+    zone_views = [
+        ReadingZoneView(
+            start=format_timecode(zone.start),
+            end=format_timecode(zone.end),
+            duration_ms=zone.end - zone.start,
+            peak_rate=round(float(zone.peak_rate), 3),
+            cue_orders=list(zone.cue_orders),
+        )
+        for zone in zones
+    ]
+
+    return ReadingLoadResponse(
+        rate_threshold=req.rate_threshold,
+        min_duration_ms=req.min_duration_ms,
+        cue_count=len(cues),
+        zone_count=len(zones),
+        cues=cue_views,
+        zones=zone_views,
     )

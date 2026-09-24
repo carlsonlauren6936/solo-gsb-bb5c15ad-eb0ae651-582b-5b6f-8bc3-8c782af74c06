@@ -1,12 +1,15 @@
-# 字幕校正与位置规划工具
+# 字幕校正、位置规划与阅读负荷工具
 
-基于 **Python + FastAPI** 的轻量 Web 工具，包含两个功能页面：
+基于 **Python + FastAPI** 的轻量 Web 工具，包含三个功能页面：
 
 1. **字幕时间漂移校正**：粘贴 SRT 字幕，填入多组人工确认的「原时间 / 正确时间」
    锚点，按分段线性映射校正字幕时间，在网页预览并下载校正后的 SRT。
 2. **字幕位置规划**（<http://localhost:8000/placement>）：粘贴 SRT，填写画面上方 /
    下方被遮挡（台标、弹幕条、滚动新闻等）的时间段与相邻字幕上下换位代价，自动为
    每条字幕选择总遮挡与换位代价最小的位置，并导出带 `line` 位置设置的 WebVTT。
+3. **阅读负荷热区**（<http://localhost:8000/reading-load>）：粘贴 SRT，输入阅读
+   速率阈值（字/秒）与热区最短持续时长（毫秒），按起止事件精确扫描时间轴，找出
+   重叠字幕合计速率严格超标的热区，页面高亮并下载同一份结果 JSON。
 
 ## 功能与校正规则（时间漂移）
 
@@ -47,6 +50,27 @@
 - 遮挡时间段起止无效（格式错误或结束不晚于开始）、换位代价不是非负整数、
   SRT 无法解析时，接口均返回 `422`，并在 `detail.message` 中给出中文原因。
 
+## 功能与分析规则（阅读负荷热区）
+
+- 输入 SRT（复用同一套字幕解析器）、**正数阅读速率阈值** `rate_threshold`
+  （字/秒，如 `5`、`4.5`）与**非负整数** `min_duration_ms`（热区最短持续毫秒数）。
+- 每条字幕的阅读速率 = **去掉所有 Unicode 空白字符**（换行、制表符、全角空格
+  `　` 等）后的字符数 ÷ 显示秒数（结束 − 开始）。
+- 按每个字幕的开始 / 结束事件扫描**半开时间轴** `[start, end)`：区间内各活跃
+  字幕的速率相加得到该区间合计速率；首尾相接（一条结束恰为另一条开始）**不算
+  重叠**。全程使用毫秒整数与精确分数比较，**不做整秒采样**，毫秒级峰值也能检出。
+- 找出合计速率**严格超过**阈值（等于阈值不算）的时间段，**首尾相接的超阈值
+  分段自动合并**为热区，再保留连续时长达到 `min_duration_ms` 的热区（先合并、
+  再按总时长过滤）。
+- 逐段返回热区的起止时间（`HH:MM:SS,mmm`）、持续毫秒数、**峰值速率**（该热区
+  内合计速率的最大值，字/秒）以及**参与字幕的输入顺序号**（按粘贴 SRT 中字幕
+  出现位置从 1 开始编号，与字幕自身的 SRT 序号无关；多分段合并后升序去重）。
+- 页面以时间轴色块、热区明细表展示结果，并在逐条字幕表中**高亮参与热区的字幕**；
+  「下载结果 JSON」保存的就是接口返回的**同一份 JSON**（`reading-load.json`）。
+- 阈值不是正数（含 `0`、负数、`NaN` / `Infinity`、布尔值、字符串）、最短时长
+  不是非负整数、SRT 无法解析时，接口均返回 `422`（`detail.field` 指出字段，
+  `detail.message` 给出中文原因；SRT 解析错误的 `detail.type` 为 `srt`）。
+
 ## 一条命令启动（Docker Compose）
 
 ```bash
@@ -57,12 +81,16 @@ docker compose up -d --build
 
 - 时间漂移校正界面：<http://localhost:8000/>
 - 字幕位置规划界面：<http://localhost:8000/placement>
+- 阅读负荷热区界面：<http://localhost:8000/reading-load>
+- 阅读负荷热区接口：`POST` <http://localhost:8000/api/reading-load>
 - 健康检查：<http://localhost:8000/health>
 - 接口文档（FastAPI 自带）：<http://localhost:8000/docs>
 
 停止：`docker compose down`
 
 ### 配置
+
+必要配置只有宿主机映射端口（容器内固定监听 8000，无需其它环境变量）：
 
 | 配置项 | 说明 | 默认值 |
 | --- | --- | --- |
@@ -73,7 +101,8 @@ docker compose up -d --build
 
 ```bash
 HOST_PORT=9000 docker compose up -d --build
-# 访问 http://localhost:9000/ 与 http://localhost:9000/placement
+# 访问 http://localhost:9000/ 、http://localhost:9000/placement
+# 与 http://localhost:9000/reading-load
 ```
 
 ## 不用 Docker，直接运行（Python 3.10+）
@@ -83,7 +112,8 @@ pip install -r requirements.txt
 uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
 
-同样访问 <http://localhost:8000/> 与 <http://localhost:8000/placement>。
+同样访问 <http://localhost:8000/>、<http://localhost:8000/placement>
+与 <http://localhost:8000/reading-load>。
 
 ## HTTP 接口
 
@@ -133,19 +163,44 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 时间段起止无效或 `switch_cost_ms` 不是非负整数时返回 `422`
 （后者为请求体校验错误，前者与 SRT 解析错误在 `detail.message` 中给出中文原因）。
 
+### `POST /api/reading-load`
+
+```json
+{
+  "srt": "1\n00:00:00,000 --> 00:00:02,000\n一二三四五六\n\n2\n00:00:01,000 --> 00:00:03,000\n四五六\n",
+  "rate_threshold": 4,
+  "min_duration_ms": 500
+}
+```
+
+`rate_threshold` 为字/秒正数（整数或小数均可，按十进制精确比较），
+`min_duration_ms` 为非负整数毫秒。成功返回：
+
+- `cues`：逐条字幕的输入顺序号 `order`、SRT 序号 `index`、起止时间、
+  `char_count`（去 Unicode 空白后的字符数）、`duration_ms` 与 `rate`（字/秒）；
+- `zones`：热区列表，每项包含 `start` / `end`（`HH:MM:SS,mmm`）、
+  `duration_ms`、`peak_rate`（峰值合计速率，字/秒）与 `cue_orders`
+  （参与字幕的输入顺序号，升序去重）；
+- `rate_threshold` / `min_duration_ms`（回显参数）、`cue_count`、`zone_count`。
+
+合计速率**严格超过**阈值的相接分段先合并，再按 `duration_ms >= min_duration_ms`
+过滤；没有热区时 `zones` 为空数组。参数不合法或 SRT 解析失败返回 `422`。
+
 ## 目录结构
 
 ```
 .
 ├── app/
-│   ├── main.py          # FastAPI 应用、/api/correct 与 /api/placement 接口
-│   ├── mapping.py       # 锚点校验与分段线性映射
-│   ├── placement.py     # 遮挡时段并集、遮挡时长统计、位置规划 DP、WebVTT 导出
-│   ├── srt.py           # SRT 解析与无损重写（仅替换时间码，保留原格式）
-│   ├── timecode.py      # 时间码解析与格式化（SRT / WebVTT）
+│   ├── main.py           # FastAPI 应用、/api/correct、/api/placement 与 /api/reading-load 接口
+│   ├── mapping.py        # 锚点校验与分段线性映射
+│   ├── placement.py      # 遮挡时段并集、遮挡时长统计、位置规划 DP、WebVTT 导出
+│   ├── reading_load.py   # 字 / 秒速率、半开时间轴事件扫描、热区合并与最短时长过滤
+│   ├── srt.py            # SRT 解析与无损重写（仅替换时间码，保留原格式）
+│   ├── timecode.py       # 时间码解析与格式化（SRT / WebVTT）
 │   └── static/
-│       ├── index.html       # 时间漂移校正页面（原生 HTML/CSS/JS）
-│       └── placement.html   # 字幕位置规划页面（原生 HTML/CSS/JS）
+│       ├── index.html         # 时间漂移校正页面（原生 HTML/CSS/JS）
+│       ├── placement.html     # 字幕位置规划页面（原生 HTML/CSS/JS）
+│       └── reading_load.html  # 阅读负荷热区页面（原生 HTML/CSS/JS）
 ├── tests/               # 核心算法与接口测试
 ├── Dockerfile
 ├── docker-compose.yml
