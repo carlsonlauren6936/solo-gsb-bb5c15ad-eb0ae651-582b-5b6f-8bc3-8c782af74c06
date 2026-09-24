@@ -1,12 +1,16 @@
-# 字幕校正与位置规划工具
+# 字幕校正、位置规划与阅读负荷工具
 
-基于 **Python + FastAPI** 的轻量 Web 工具，包含两个功能页面：
+基于 **Python + FastAPI** 的轻量 Web 工具，包含三个功能页面：
 
 1. **字幕时间漂移校正**：粘贴 SRT 字幕，填入多组人工确认的「原时间 / 正确时间」
    锚点，按分段线性映射校正字幕时间，在网页预览并下载校正后的 SRT。
 2. **字幕位置规划**（<http://localhost:8000/placement>）：粘贴 SRT，填写画面上方 /
    下方被遮挡（台标、弹幕条、滚动新闻等）的时间段与相邻字幕上下换位代价，自动为
    每条字幕选择总遮挡与换位代价最小的位置，并导出带 `line` 位置设置的 WebVTT。
+3. **阅读负荷热区**（<http://localhost:8000/reading-load>）：粘贴 SRT，按
+   「字数 ÷ 显示秒数」计算每条字幕的阅读速率（字/秒），重叠字幕速率相加，扫描出
+   合计速率超阈且持续足够久的热区并在页面高亮、下载同一结果的 JSON；
+   对应接口 `POST /api/reading-load`（<http://localhost:8000/api/reading-load>）。
 
 ## 功能与校正规则（时间漂移）
 
@@ -47,6 +51,32 @@
 - 遮挡时间段起止无效（格式错误或结束不晚于开始）、换位代价不是非负整数、
   SRT 无法解析时，接口均返回 `422`，并在 `detail.message` 中给出中文原因。
 
+## 功能与扫描规则（阅读负荷热区）
+
+- 输入 SRT（复用同一套字幕解析器）、**阅读速率阈值** `threshold`（字/秒，
+  **正数**，可填小数）与**热区最短持续时间** `min_duration_ms`（毫秒，
+  **非负整数**，填 `0` 表示不设下限）。
+- 每条字幕的速率 = **去掉全部 Unicode 空白后的字符数**（普通空格、制表符、
+  换行、全角空格 `　`、不间断空格 ` ` 等均不计字）÷ **显示秒数**
+  （结束 − 开始）。
+- **重叠字幕的速率相加**：同一时刻有多条字幕显示时，合计速率为各条速率之和；
+  每条字幕在自身显示区间内速率恒定。
+- 按全部字幕的**开始 / 结束事件**把时间轴切成半开区间 `[t, t+1)` 逐段扫描，
+  **不做整秒采样**，毫秒及更细粒度的速率变化都能识别。
+- 找出合计速率**严格超过**阈值（等于不算）的连续区间：相接的超阈区间
+  （前一段结束时间 = 下一段开始时间）**自动合并**为一个热区，被任意长度的
+  非超阈区间隔开则保持独立；仅当连续时长达到 `min_duration_ms` 才保留。
+- 逐段（逐热区）返回**起止时间**（`HH:MM:SS,mmm` 及毫秒整数）、
+  **峰值速率** `peak_rate`（字/秒，区间内合计速率的最大值）以及
+  **参与字幕的输入顺序号** `cue_orders`（1 起步，按 SRT 解析顺序；即按
+  字幕块在粘贴文本中的先后，而非 SRT 文件内写的序号），同时返回逐条字幕的
+  字数、时长与速率供核对。
+- 页面中用橙色高亮参与热区的字幕、按真实时间比例绘制热区时间轴，点击热区可
+  定位参与字幕；**下载的 `reading-load.json` 与页面展示、接口返回为同一份
+  JSON 结果**。
+- 阈值不是正数（含 `0`、负数、布尔值、字符串、`NaN` / `Infinity`）、
+  最短持续不是非负整数或 SRT 无法解析时，接口均返回 `422`。
+
 ## 一条命令启动（Docker Compose）
 
 ```bash
@@ -55,8 +85,10 @@ docker compose up -d --build
 
 启动后访问：
 
-- 时间漂移校正界面：<http://localhost:8000/>
+- 时间漂移校正界面（默认首页）：<http://localhost:8000/>
 - 字幕位置规划界面：<http://localhost:8000/placement>
+- 阅读负荷热区界面：<http://localhost:8000/reading-load>
+- 阅读负荷热区接口：`POST` <http://localhost:8000/api/reading-load>
 - 健康检查：<http://localhost:8000/health>
 - 接口文档（FastAPI 自带）：<http://localhost:8000/docs>
 
@@ -73,7 +105,8 @@ docker compose up -d --build
 
 ```bash
 HOST_PORT=9000 docker compose up -d --build
-# 访问 http://localhost:9000/ 与 http://localhost:9000/placement
+# 访问 http://localhost:9000/ 、http://localhost:9000/placement
+# 与 http://localhost:9000/reading-load（接口 /api/reading-load）
 ```
 
 ## 不用 Docker，直接运行（Python 3.10+）
@@ -83,7 +116,8 @@ pip install -r requirements.txt
 uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
 
-同样访问 <http://localhost:8000/> 与 <http://localhost:8000/placement>。
+同样访问 <http://localhost:8000/>、<http://localhost:8000/placement>
+与 <http://localhost:8000/reading-load>（接口 `POST /api/reading-load`）。
 
 ## HTTP 接口
 
@@ -133,19 +167,73 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 时间段起止无效或 `switch_cost_ms` 不是非负整数时返回 `422`
 （后者为请求体校验错误，前者与 SRT 解析错误在 `detail.message` 中给出中文原因）。
 
+### `POST /api/reading-load`
+
+```json
+{
+  "srt": "1\n00:00:00,000 --> 00:00:02,000\n一二三四五六\n\n2\n00:00:01,000 --> 00:00:04,000\nABCDEFGHI\n",
+  "threshold": 5,
+  "min_duration_ms": 0
+}
+```
+
+成功返回：
+
+- `threshold` / `min_duration_ms`：回显本次使用的阈值与最短持续毫秒；
+- `zones`：热区列表，每项含 `start` / `end`（`HH:MM:SS,mmm`）、
+  `start_ms` / `end_ms` / `duration_ms`（毫秒整数）、`peak_rate`
+  （峰值合计速率，字/秒）与 `cue_orders`（参与字幕的输入顺序号，1 起步）；
+- `cues`：逐条字幕的 `order`（输入顺序号）、`index`（SRT 中书写的序号）、
+  起止时间、`chars`（去 Unicode 空白后的字数）、`duration_ms`、`rate`
+  （字/秒）与文本。
+
+上例中两条字幕速率均为 3 字/秒，重叠段 `00:00:01,000 → 00:00:02,000`
+合计 6 字/秒，严格超过阈值 5，返回 1 个热区：
+
+```json
+{
+  "threshold": 5.0,
+  "min_duration_ms": 0,
+  "zones": [
+    {
+      "start": "00:00:01,000",
+      "end": "00:00:02,000",
+      "start_ms": 1000,
+      "end_ms": 2000,
+      "duration_ms": 1000,
+      "peak_rate": 6.0,
+      "cue_orders": [1, 2]
+    }
+  ],
+  "cues": [
+    {"order": 1, "index": "1", "start": "00:00:00,000", "end": "00:00:02,000",
+     "chars": 6, "duration_ms": 2000, "rate": 3.0, "text": "一二三四五六"},
+    {"order": 2, "index": "2", "start": "00:00:01,000", "end": "00:00:04,000",
+     "chars": 9, "duration_ms": 3000, "rate": 3.0, "text": "ABCDEFGHI"}
+  ]
+}
+```
+
+`threshold` 必须为正数（整数或小数；布尔值、字符串、`NaN` 等拒绝），
+`min_duration_ms` 必须为非负整数，SRT 解析失败时同样返回 `422`
+（后两者为请求体校验错误，SRT 错误在 `detail.message` 中给出中文原因）。
+页面下载的 `reading-load.json` 即该接口的完整响应体。
+
 ## 目录结构
 
 ```
 .
 ├── app/
-│   ├── main.py          # FastAPI 应用、/api/correct 与 /api/placement 接口
-│   ├── mapping.py       # 锚点校验与分段线性映射
-│   ├── placement.py     # 遮挡时段并集、遮挡时长统计、位置规划 DP、WebVTT 导出
-│   ├── srt.py           # SRT 解析与无损重写（仅替换时间码，保留原格式）
-│   ├── timecode.py      # 时间码解析与格式化（SRT / WebVTT）
+│   ├── main.py           # FastAPI 应用、/api/correct、/api/placement 与 /api/reading-load 接口
+│   ├── mapping.py        # 锚点校验与分段线性映射
+│   ├── placement.py      # 遮挡时段并集、遮挡时长统计、位置规划 DP、WebVTT 导出
+│   ├── reading_load.py   # 字/秒速率计算、起止事件半开时间轴扫描、热区合并
+│   ├── srt.py            # SRT 解析与无损重写（仅替换时间码，保留原格式）
+│   ├── timecode.py       # 时间码解析与格式化（SRT / WebVTT）
 │   └── static/
-│       ├── index.html       # 时间漂移校正页面（原生 HTML/CSS/JS）
-│       └── placement.html   # 字幕位置规划页面（原生 HTML/CSS/JS）
+│       ├── index.html        # 时间漂移校正页面（原生 HTML/CSS/JS）
+│       ├── placement.html    # 字幕位置规划页面（原生 HTML/CSS/JS）
+│       └── reading_load.html # 阅读负荷热区页面（原生 HTML/CSS/JS）
 ├── tests/               # 核心算法与接口测试
 ├── Dockerfile
 ├── docker-compose.yml
